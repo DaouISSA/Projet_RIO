@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Itinéraire Parking Issa</title>
+    <style>
+        #parkingMap { border: 2px solid #333; background: #eee; }
+        .controls { margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h1>Assistant de Parking</h1>
+    
+    <div class="controls">
+        <button onclick="reserverPlace()">Trouver une place & itinéraire</button>
+        <p id="message"></p>
+    </div>
+
+    <canvas id="parkingMap" width="400" height="300"></canvas>
+
+    <script>
+        const canvas = document.getElementById('parkingMap');
+        const ctx = canvas.getContext('2d');
+        const entree = { x: 200, y: 280 }; // Position de l'entrée en bas au milieu
+
+        function dessinerPlan() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Dessiner l'entrée
+            ctx.fillStyle = "blue";
+            ctx.fillRect(entree.x - 10, entree.y, 20, 10);
+            ctx.fillText("ENTRÉE", entree.x - 20, entree.y + 25);
+        }
+
+        async function reserverPlace() {
+            const res = await fetch('http://127.0.0.1:8000/booking/request', { method: 'POST' });
+            const data = await res.json();
+            console.log('Réponse réservation:', data);
+
+            if (data.status === "success") {
+                const target = data.assigned_coordinates || data.coordinates;
+                const info = `Place ${data.assigned_spot} → (${target.x}, ${target.y})` +
+                    (data.request_received_at ? ` • reçu: ${data.request_received_at}` : "");
+                document.getElementById('message').innerText = `${data.message} ${info}`;
+                tracerItineraire(target);
+            } else {
+                document.getElementById('message').innerText = data.message;
+            }
+        }
+
+        function tracerItineraire(dest) {
+            dessinerPlan();
+            
+            // Tracer le chemin
+            ctx.beginPath();
+            ctx.strokeStyle = "red";
+            ctx.lineWidth = 3;
+            ctx.setLineDash([5, 5]); // Pointillés pour l'effet "itinéraire"
+            
+            ctx.moveTo(entree.x, entree.y);      // Départ
+            ctx.lineTo(dest.x * 5, entree.y);    // Angle droit (simulé)
+            ctx.lineTo(dest.x * 5, dest.y * 5);  // Arrivée (on multiplie par 5 pour l'échelle)
+            ctx.stroke();
+
+            // Dessiner la place cible
+            ctx.fillStyle = "green";
+            ctx.setLineDash([]);
+            ctx.fillRect(dest.x * 5 - 15, dest.y * 5 - 15, 30, 30);
+            ctx.fillText(dest.x + "," + dest.y, dest.x * 5 - 10, dest.y * 5 - 20);
+        }
+
+        dessinerPlan();
+    </script>
+</body>
+</html>
