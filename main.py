@@ -1,8 +1,10 @@
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import sqlite3
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
+import json
 
 app = FastAPI(title="Serveur Parking Issa - SQLite")
 
@@ -29,12 +31,18 @@ def init_db():
     """)
     cursor.execute("SELECT COUNT(*) FROM parking_spots")
     if cursor.fetchone()[0] == 0:
-        places = [
-            ('A1', 'free', '2024-01-01 00:00:00', 10, 20),
-            ('A2', 'free', '2024-01-01 00:00:00', 10, 40),
-            ('B1', 'free', '2024-01-01 00:00:00', 50, 20),
-            ('B2', 'free', '2024-01-01 00:00:00', 50, 40)
-        ]
+        places = []
+        
+        # Rangée A (haut) - 5 places
+        for i in range(1, 4):
+            x = 0 + (i - 1) * 18  # Déplacé vers la gauche
+            places.append((f'A{i}', 'free', '2024-01-01 00:00:00', x, 20))
+        
+        # Rangée B (bas) - 5 places
+        for i in range(1, 4):
+            x = 0 + (i - 1) * 18  # Déplacé vers la gauche
+            places.append((f'B{i}', 'free', '2024-01-01 00:00:00', x, 70))
+        
         cursor.executemany("INSERT INTO parking_spots VALUES (?,?,?,?,?)", places)
     conn.commit()
     conn.close()
@@ -42,12 +50,10 @@ def init_db():
 init_db()
 
 # Positions par défaut pour les places connues (fallback si DB incomplète)
-DEFAULT_POSITIONS = {
-    "A1": (10, 20),
-    "A2": (10, 40),
-    "B1": (50, 20),
-    "B2": (50, 40),
-}
+DEFAULT_POSITIONS = {}
+for i in range(1, 4):
+    DEFAULT_POSITIONS[f'A{i}'] = (0 + (i - 1) * 18, 20)
+    DEFAULT_POSITIONS[f'B{i}'] = (0 + (i - 1) * 18, 70)
 
 class SensorData(BaseModel):
     id: str
@@ -55,7 +61,8 @@ class SensorData(BaseModel):
 
 @app.get("/")
 async def read_root():
-    return {"message": "Bienvenue sur le serveur de gestion du parking", "owner": "Issa"}
+    """Servir la page HTML du parking"""
+    return FileResponse("test.html", media_type="text/html")
 
 @app.post("/update")
 async def update_spot(sensor: SensorData):
@@ -69,6 +76,7 @@ async def update_spot(sensor: SensorData):
     )
     conn.commit()
     conn.close()
+    
     return {"message": f"Place {sensor.id} mise à jour", "status": sensor.status}
 
 @app.get("/parking/status")
@@ -115,6 +123,10 @@ async def request_spot():
             ("occupied", now, spot["id"]),
         )
         conn.commit()
+        
+        # Calculer l'itinéraire précis
+        itinerary_waypoints = calculate_itinerary(pos_x, pos_y, spot["id"])
+        
         response = {
             "status": "success",
             "assigned_spot": spot["id"],
@@ -122,15 +134,50 @@ async def request_spot():
             "coordinates": {"x": pos_x, "y": pos_y},
             "assigned_coordinates": {"x": pos_x, "y": pos_y},
             "request_received_at": now,
-            "itinerary_steps": [
-                "Entrez dans le parking",
-                f"Suivez l'itinéraire vers x={pos_x}, y={pos_y}"
-            ]
+            "itinerary_steps": itinerary_waypoints["steps"],
+            "waypoints": itinerary_waypoints["waypoints"]
         }
         conn.close()
         return response
     conn.close()
     return {"status": "error", "message": "Parking complet"}
+
+def calculate_itinerary(target_x, target_y, spot_id):
+    """Calcule un itinéraire réaliste vers la place spécifiée"""
+    
+    # Entrée du parking (en bas au centre)
+    entry_x = 100
+    entry_y = 100  # En bas du parking
+    
+    # Allée principale (centre entre rangées A et B)
+    allee_y = 45
+    
+    # Déterminer la rangée (A=haut ou B=bas)
+    rangee = spot_id[0]
+    is_rangee_a = (rangee == 'A')
+    
+    # Créer les points de passage simplifié
+    waypoints = [
+        {"x": entry_x, "y": entry_y},  # 1. Entrée du parking
+        {"x": entry_x, "y": allee_y},  # 2. Monter à l'allée principale
+        {"x": target_x, "y": allee_y},  # 3. Avancer jusqu'à l'alignement de la place
+        {"x": target_x, "y": target_y}     # 4. Place finale
+    ]
+    
+    # Direction selon la rangée
+    direction = "haut" if is_rangee_a else "bas"
+    
+    steps = [
+        f"Point 1 : Entrée du parking",
+        f"Point 2 : Monter à l'allée principale",
+        f"Point 3 : Avancer jusqu'à l'alignement de la place {spot_id} ({direction})",
+        f"Point 4 : Place finale {spot_id}"
+    ]
+    
+    return {
+        "waypoints": waypoints,
+        "steps": steps
+    }
 
 # --- UTILITAIRE: remettre toutes les places en 'free' ---
 def free_all_spots() -> int:
@@ -150,6 +197,7 @@ def free_all_spots() -> int:
 @app.post("/parking/reset")
 async def reset_parking():
     count = free_all_spots()
+    
     return {
         "status": "success",
         "freed_count": count,
