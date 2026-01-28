@@ -51,6 +51,10 @@ import json
 import cv2
 import numpy as np
 from typing import Dict, Tuple
+import requests
+from requests.exceptions import RequestException
+import threading  #Post HTTP Threads
+import queue
 
 
 # ======================
@@ -61,6 +65,17 @@ from typing import Dict, Tuple
 USE_RTSP = True
 RTSP_URL = "rtsp://10.111.191.109:8554/cam"   # your phone stream
 CAM_INDEX = 0                                  # used if USE_RTSP=False
+
+# --- Threads Config --- #
+POST_QUEUE_SIZE = 1  # 1 = toujours garder le dernier état
+
+post_queue = queue.Queue(maxsize=POST_QUEUE_SIZE)
+stop_event = threading.Event()
+
+# --- Server Config --- 
+SERVER_URL = "http://127.0.0.1:8000/"
+SEND_EVERY_SEC = 2.5
+HTTP_TIMEOUT = 1.0
 
 # --- Homography calibration file ---
 CALIB_FILE = "calib.json"
@@ -83,8 +98,8 @@ X_R0 = 0.60
 X_R1 = 0.99
 
 # Vertical range used for parking + aisle (avoid borders if needed)
-Y0 = 0.25
-Y1 = 0.87
+Y0 = 0.23
+Y1 = 0.95
 
 # Slots layout: 3 rows x 4 columns on each side (as you described)
 SLOT_ROWS = 3
@@ -109,10 +124,20 @@ PRESENCE_DIFF_THR = 20
 AISLE_OCC_THR = 0.08           # "something is in the aisle segment"
 SLOT_OCC_THR  = 0.08           # "something is in a slot"
 
+# --- Mini-allee Occupancy thresholds + Ratio ---
+SLOT_APRON_RATIO = 0.35   # 20% de la hauteur de la case = mini-allée (0.15..0.30)
+APRON_OCC_THR = 0.06      # seuil présence pour dire "quelque chose bloque devant"
+APRON_MOTION_THR = 0.015  # seuil motion (comme l'allée)
+APRON_STOP_SEC = 2.0      # durée d'arrêt pour déclarer congestion sur mini-allée
+
 # Motion (frame-to-frame) thresholds
 MOTION_DIFF_THR = 15           # pixel change threshold for motion mask
 AISLE_MOTION_THR = 0.010       # below -> considered "not moving"
 SLOT_MOTION_THR  = 0.008       # below -> considered "not moving"
+
+# --- Anti-ombres (presence via HSV) ---
+USE_HSV_PRESENCE = True
+HS_DIFF_THR = 35      # seuil sur diff(H,S), à ajuster 15..40
 
 # Timers (seconds)
 STOP_SEC = 3.0                 # aisle must be "present & not moving" for this long => congestion
@@ -156,6 +181,7 @@ def build_zones(out_w: int, out_h: int):
 
     aisle_masks: Dict[str, np.ndarray] = {}
     slot_masks: Dict[str, np.ndarray] = {}
+    apron_masks: Dict[str, np.ndarray] = {}
     boxes: Dict[str, Tuple[float, float, float, float]] = {}
 
     # ---- AISLE segments (split vertically into AISLE_SEGMENTS) ----
@@ -169,15 +195,36 @@ def build_zones(out_w: int, out_h: int):
     # ---- Slots: Left side 3x4 and Right side 3x4 ----
     # We split each side rectangle into a grid.
     def add_slot_grid(side_prefix: str, x0_: float, x1_: float):
-        for r in range(SLOT_ROWS):
-            yy0 = y0 + (y1 - y0) * r / SLOT_ROWS
-            yy1 = y0 + (y1 - y0) * (r + 1) / SLOT_ROWS
-            for c in range(SLOT_COLS):
-                xx0 = x0_ + (x1_ - x0_) * c / SLOT_COLS
-                xx1 = x0_ + (x1_ - x0_) * (c + 1) / SLOT_COLS
-                name = f"{side_prefix}_{r}_{c}"
-                slot_masks[name] = rect_mask(out_w, out_h, xx0, yy0, xx1, yy1)
-                boxes[name] = (xx0, yy0, xx1, yy1)
+        cell_w = (x1_ - x0_) / SLOT_COLS
+        cell_h = (y1 - y0) / SLOT_ROWS
+
+        apron_h = SLOT_APRON_RATIO * cell_h
+
+        for r in range(1, SLOT_ROWS + 1):
+            # limites verticales de la cellule r
+            yy0 = y0 + (r - 1) * cell_h
+            yy1 = y0 + r * cell_h
+
+            # split vertical : [slot_y0..slot_y1] + [ap_y0..ap_y1]
+            slot_y0 = yy0
+            slot_y1 = yy1 - apron_h  # partie haute
+            ap_y0   = yy1 - apron_h  # bande basse
+            ap_y1   = yy1
+
+            for c in range(1, SLOT_COLS + 1):
+                # limites horizontales de la cellule c
+                xx0 = x0_ + (c - 1) * cell_w
+                xx1 = x0_+ c * cell_w
+
+                # ---- SLOT (place) ----
+                sname = f"{side_prefix}_{r}_{c}"
+                slot_masks[sname] = rect_mask(out_w, out_h, xx0, slot_y0, xx1, slot_y1)
+                boxes[sname] = (xx0, slot_y0, xx1, slot_y1)
+
+                # ---- APRON (mini-allée sous la place) ----
+                aname = f"A_{side_prefix}_{r}_{c}"
+                apron_masks[aname] = rect_mask(out_w, out_h, xx0, ap_y0, xx1, ap_y1)
+                boxes[aname] = (xx0, ap_y0, xx1, ap_y1)
 
     add_slot_grid("L", xL0, xL1)
     add_slot_grid("R", xR0, xR1)
@@ -185,8 +232,10 @@ def build_zones(out_w: int, out_h: int):
     # Compute mask areas once (number of non-zero pixels)
     aisle_area = {k: float(np.count_nonzero(m)) for k, m in aisle_masks.items()}
     slot_area  = {k: float(np.count_nonzero(m)) for k, m in slot_masks.items()}
+    apron_area = {k: float(np.count_nonzero(m)) for k, m in apron_masks.items()}
 
-    return aisle_masks, slot_masks, boxes, aisle_area, slot_area
+
+    return aisle_masks, slot_masks, apron_masks, boxes, aisle_area, slot_area, apron_area
 
 
 # ======================
@@ -232,12 +281,30 @@ def presence_from_background(bg_gray: np.ndarray, gray: np.ndarray) -> np.ndarra
     pm = morph_open(pm, KERNEL_OPEN)
     return pm
 
+def presence_from_background_hsv(bg_bgr: np.ndarray, curr_bgr: np.ndarray) -> np.ndarray:
+    """
+    Anti-ombres: calcule la présence en comparant H et S (pas V).
+    Retourne un masque binaire 0/255.
+    """
+    bg_hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
+    cur_hsv = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2HSV)
+
+    dh = cv2.absdiff(cur_hsv[:, :, 0], bg_hsv[:, :, 0])
+    ds = cv2.absdiff(cur_hsv[:, :, 1], bg_hsv[:, :, 1])
+
+    # Combine H+S (ombre => faible, objet => plus fort)
+    diff = cv2.addWeighted(dh, 0.7, ds, 0.3, 0)
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+
+    _, pm = cv2.threshold(diff, HS_DIFF_THR, 255, cv2.THRESH_BINARY)
+    pm = morph_open(pm, KERNEL_OPEN)
+    return pm
 
 # ======================
 # State machines
 # ======================
 
-def reset_states(aisle_masks, slot_masks):
+def reset_states(aisle_masks, slot_masks, apron_masks):
     """
     Initialize state dicts for aisle and slots.
     We keep timers to know how long the condition holds.
@@ -261,8 +328,15 @@ def reset_states(aisle_masks, slot_masks):
             "parked": False,     # decision
         }
 
-    return aisle_state, slot_state
-
+    apron_state = {}
+    for k in apron_masks.keys():
+        apron_state[k] = {
+            "occ": 0.0,
+            "motion": 0.0,
+            "t0": None,
+            "congested": False,
+        }
+    return aisle_state, slot_state, apron_state
 
 def update_slots(slot_state: Dict, slot_occ: Dict[str, float], slot_mot: Dict[str, float],
                  now: float) -> Tuple[Dict, bool]:
@@ -334,20 +408,123 @@ def update_aisle(aisle_state: Dict, aisle_occ: Dict[str, float], aisle_mot: Dict
 
     return aisle_state
 
+def update_aprons(apron_state: Dict, apron_occ: Dict[str, float], apron_mot: Dict[str, float],
+                  now: float) -> Dict:
+    """
+    Congestion locale devant les places (mini-allées).
+    """
+    for name, st in apron_state.items():
+        occ = apron_occ[name]
+        mot = apron_mot[name]
+        st["occ"] = occ
+        st["motion"] = mot
+
+        stopped_and_present = (occ >= APRON_OCC_THR) and (mot <= APRON_MOTION_THR)
+
+        if stopped_and_present:
+            if st["t0"] is None:
+                st["t0"] = now
+            st["congested"] = (now - st["t0"]) >= APRON_STOP_SEC
+        else:
+            st["t0"] = None
+            st["congested"] = False
+
+    return apron_state
+# ======================
+# Payloads for Server
+# ======================
+
+def build_cars_payload(slot_state, boxes, now):
+    """
+    Construit la liste des voitures détectées dans les slots.
+    - occupied : présence détectée maintenant
+    - parked   : présence + immobile depuis PARK_SEC
+    """
+    cars = []
+
+    for slot_name, st in slot_state.items():
+        if not st["occupied"]:
+            continue
+
+        side, r, c = parse_slot_name(slot_name)
+        cx, cy = box_center(boxes[slot_name])
+
+        cars.append({
+            "id": slot_name,                # ex: "L_1_2"
+            "side": side,                   # "L" / "R"
+            "row": r,
+            "col": c,
+            "occupied": True,
+            #"parked": bool(st["parked"]),
+            #"occupancy": round(st["occ"], 3),
+            #"motion": round(st["motion"], 3),
+            "pos_top": {"x": round(cx, 1), "y": round(cy, 1)},  # pixels top-view
+        })
+
+    payload = {
+        "timestamp": now,
+        "cars": cars,
+        "cars_count": len(cars),
+    }
+    return payload
+
+def post_worker(server_url, q, stop_evt):         #post_payload
+    print("[POST-THREAD] started")  # <-- AJOUT
+    while not stop_evt.is_set():
+        try:
+            payload = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        try:
+            r = requests.post(server_url, json=payload, timeout=0.5)
+            print(f"[POST-THREAD] sent cars={payload.get('cars_count')} code={r.status_code}")  # <-- AJOUT
+        except RequestException as e:
+            print(f"[POST-THREAD] ERROR: {e}")  # <-- AJOUT (au moins pendant debug)
+        finally:
+            q.task_done()
 
 # ======================
 # Drawing helpers
 # ======================
 
-def draw_boxes(img: np.ndarray, boxes: Dict[str, Tuple[float, float, float, float]]):
-    """Draw all zone rectangles."""
+def draw_boxes(img, boxes, aisle_state, apron_state):
     for name, (x0, y0, x1, y1) in boxes.items():
-        cv2.rectangle(img, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 2)
 
+        # --- Détection du type de zone ---
+        if name.startswith("C"):
+            congested = aisle_state[name]["congested"]
+        elif name.startswith("A_"):
+            congested = apron_state[name]["congested"]
+        else:
+            congested = False  # slots normaux
+
+        # --- Couleur ---
+        if congested:
+            color = (0, 0, 255)      # ROUGE = congestion
+            thickness = 3
+        else:
+            color = (0, 255, 0)      # VERT = OK
+            thickness = 2
+
+        cv2.rectangle(img,(int(x0), int(y0)),(int(x1), int(y1)),color,thickness)
 
 def put_text(img: np.ndarray, x: int, y: int, s: str, scale: float = 0.55, thick: int = 2):
     """Convenience for text overlay."""
     cv2.putText(img, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 0), thick, cv2.LINE_AA)
+
+def box_center(box):
+    """Retourne le centre (cx, cy) d'une box (x0,y0,x1,y1) en pixels top-view."""
+    x0, y0, x1, y1 = box
+    return (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+
+def parse_slot_name(name: str):
+    """
+    name format: 'L_r_c' or 'R_r_c'
+    Retourne (side, r, c) où side='L' ou 'R'.
+    """
+    side, r, c = name.split("_")
+    return side, int(r), int(c)
 
 
 # ======================
@@ -362,15 +539,17 @@ def main():
     # Homography matrix (3x3) mapping camera image -> top view
     M = np.array(calib["M"], dtype=np.float32)
 
+    bg_bgr = None # l’image top-view couleur, pas seulement le gris.
+
     # Output top-view size
     out_w = int(calib.get("out_w", 640))
     out_h = int(calib.get("out_h", 480))
 
     # Build zone masks
-    aisle_masks, slot_masks, boxes, aisle_area, slot_area = build_zones(out_w, out_h)
+    aisle_masks, slot_masks, apron_masks, boxes, aisle_area, slot_area, apron_area = build_zones(out_w, out_h)
 
     # Init states
-    aisle_state, slot_state = reset_states(aisle_masks, slot_masks)
+    aisle_state, slot_state, apron_state = reset_states(aisle_masks, slot_masks, apron_masks)
 
     # For motion computation
     prev_gray = None
@@ -385,6 +564,9 @@ def main():
     # Parking maneuver grace timer
     last_parking_event = -1e9  # "very old"
 
+    # timer to send requests to the server every seconds
+    last_send = 0.0
+
     # -------- Open camera stream --------
     cap = cv2.VideoCapture(RTSP_URL if USE_RTSP else CAM_INDEX)
 
@@ -393,6 +575,14 @@ def main():
 
     print("[INFO] Press 'b' to capture background (recommended).")
     print("[INFO] Press 'r' to reset states, 'q' or ESC to quit.")
+
+    # -------- Thread POST created --------
+    post_thread = threading.Thread(
+        target=post_worker,
+        args=(SERVER_URL, post_queue, stop_event),
+        daemon=True
+    )
+    post_thread.start()
 
 
     # -------- Main loop --------
@@ -423,12 +613,13 @@ def main():
             fg = morph_open(fg, KERNEL_OPEN)
             presence_mask = fg
         else:
-            # Presence via background difference (recommended for parked detection)
-            if bg_gray is None:
-                # If background not captured yet, we can't compute a reliable presence mask
+            if bg_bgr is None:
                 presence_mask = np.zeros((out_h, out_w), dtype=np.uint8)
             else:
-                presence_mask = presence_from_background(bg_gray, gray)
+                if USE_HSV_PRESENCE:
+                    presence_mask = presence_from_background_hsv(bg_bgr, top)
+                else:
+                    presence_mask = presence_from_background(bg_gray, gray)
 
         # Update prev frame
         prev_gray = gray
@@ -436,9 +627,12 @@ def main():
         # Compute occupancy & motion ratios per zone
         aisle_occ = compute_occupancy(presence_mask, aisle_masks, aisle_area)
         slot_occ  = compute_occupancy(presence_mask, slot_masks, slot_area)
+        apron_occ = compute_occupancy(presence_mask, apron_masks, apron_area)
 
         aisle_mot = compute_occupancy(motion_mask, aisle_masks, aisle_area)
         slot_mot  = compute_occupancy(motion_mask, slot_masks, slot_area)
+        apron_mot = compute_occupancy(motion_mask,  apron_masks, apron_area)
+
 
         # Update states + timers
         now = time.time()
@@ -449,20 +643,37 @@ def main():
 
         grace_active = (now - last_parking_event) <= MANEUVER_GRACE_SEC
         aisle_state = update_aisle(aisle_state, aisle_occ, aisle_mot, now, grace_active)
+        apron_state = update_aprons(apron_state, apron_occ, apron_mot, now)
+
+        # -------- Envoi serveur toutes les SEND_EVERY_SEC secondes --------
+        if (now - last_send) >= SEND_EVERY_SEC:
+            payload = build_cars_payload(slot_state, boxes, now)
+
+            # push non bloquant : on garde le dernier état seulement
+            try:
+                if post_queue.full():
+                    post_queue.get_nowait()
+                post_queue.put_nowait(payload)
+            except queue.Empty:
+                pass
+
+            last_send = now
+        # --------------------------------------------------------------------
 
         # -------- Overlay / Debug --------
         overlay = top.copy()
-        draw_boxes(overlay, boxes)
+        draw_boxes(overlay, boxes, aisle_state, apron_state)
 
         # Display summary line
         n_occ_slots = sum(1 for st in slot_state.values() if st["occupied"])
         n_parked    = sum(1 for st in slot_state.values() if st["parked"])
         n_cong      = sum(1 for st in aisle_state.values() if st["congested"])
+        n_apron_cong = sum(1 for st in apron_state.values() if st["congested"])
 
         put_text(overlay, 10, 20,
                  f"BG={'YES' if bg_gray is not None else 'NO'}  "
                  f"Slots occ={n_occ_slots} parked={n_parked}  "
-                 f"Aisle congested segs={n_cong}  "
+                 f"Aisle congested segs={n_cong}  Apron cong={n_apron_cong}   "
                  f"Grace={'ON' if grace_active else 'OFF'}",
                  scale=0.6)
 
@@ -475,6 +686,16 @@ def main():
             put_text(overlay, int(x0) + 5, int(y0) + 18,
                      f"{name} occ={st['occ']*100:4.1f}% mot={st['motion']*100:4.1f}% {tag}",
                      scale=0.55)
+            
+        # --- AJOUT: afficher les mini-allées (aprons) ---
+        for name, (x0, y0, x1, y1) in boxes.items():
+            if not name.startswith("A_"):
+                continue
+            st = apron_state[name]
+            tag = "CONG" if st["congested"] else "ok"
+            put_text(overlay, int(x0) + 4, int(y0) + 16,
+                    f"{st['occ']*100:4.1f}% {tag}",
+                    scale=0.3)
 
         # Optionally, show slots with a tiny status (occupied/parked)
         # We keep this light to avoid clutter.
@@ -498,15 +719,17 @@ def main():
 
         if key == ord('b'):
             # Capture background reference from current frame
-            bg_gray = gray.copy()
+            bg_gray = gray.copy()       # tu peux garder si tu veux debug
+            bg_bgr = top.copy()         # <-- AJOUT: background couleur pour HSV
             print("[INFO] Background captured.")
 
         if key == ord('r'):
             # Reset states/timers
-            aisle_state, slot_state = reset_states(aisle_masks, slot_masks)
+            aisle_state, slot_state, apron_state = reset_states(aisle_masks, slot_masks, apron_masks)
             last_parking_event = -1e9
             print("[INFO] States reset.")
 
+    stop_event.set()
     cap.release()
     cv2.destroyAllWindows()
 
