@@ -49,7 +49,7 @@ def init_db():
         places_per_side = 4
 
         for allee, x in allees_x.items():
-            # Places à gauche (avant l'intersection)
+            # Places à gauche 
             for i in range(places_per_side):
                 y = MAIN_Y - (i + 1) * spacing_y
                 places.append((
@@ -60,7 +60,7 @@ def init_db():
                     y
                 ))
 
-            # Places à droite (après l'intersection)
+            # Places à droite
             for i in range(places_per_side):
                 y = MAIN_Y + (i + 1) * spacing_y
                 places.append((
