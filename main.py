@@ -32,18 +32,50 @@ def init_db():
     cursor.execute("SELECT COUNT(*) FROM parking_spots")
     if cursor.fetchone()[0] == 0:
         places = []
-        
-        # Rangée A (haut) - 5 places
-        for i in range(1, 4):
-            x = 0 + (i - 1) * 18  # Déplacé vers la gauche
-            places.append((f'A{i}', 'free', '2024-01-01 00:00:00', x, 20))
-        
-        # Rangée B (bas) - 5 places
-        for i in range(1, 4):
-            x = 0 + (i - 1) * 18  # Déplacé vers la gauche
-            places.append((f'B{i}', 'free', '2024-01-01 00:00:00', x, 70))
-        
-        cursor.executemany("INSERT INTO parking_spots VALUES (?,?,?,?,?)", places)
+
+        # Artère principale
+        MAIN_Y = 100
+
+        # Allées perpendiculaires (X fixe)
+        allees_x = {
+            "A": 40,
+            "B": 80,
+            "C": 120,
+            "D": 160,
+        }
+
+        # Paramètres des places
+        spacing_y = 12  # espacement entre places
+        places_per_side = 4
+
+        for allee, x in allees_x.items():
+            # Places à gauche (avant l'intersection)
+            for i in range(places_per_side):
+                y = MAIN_Y - (i + 1) * spacing_y
+                places.append((
+                    f"{allee}{i + 1}",
+                    "free",
+                    "2024-01-01 00:00:00",
+                    x,
+                    y
+                ))
+
+            # Places à droite (après l'intersection)
+            for i in range(places_per_side):
+                y = MAIN_Y + (i + 1) * spacing_y
+                places.append((
+                    f"{allee}{i + 5}",
+                    "free",
+                    "2024-01-01 00:00:00",
+                    x,
+                    y
+                ))
+
+    cursor.executemany(
+        "INSERT INTO parking_spots VALUES (?,?,?,?,?)",
+        places
+    )
+
     conn.commit()
     conn.close()
 
